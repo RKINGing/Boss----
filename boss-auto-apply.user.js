@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.3.0
+// @version      0.3.1
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，可附带图片简历，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/job*
@@ -43,7 +43,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.3.0',
+    version: '0.3.1',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
@@ -6021,26 +6021,45 @@
 
   // 从右侧岗位详情 DOM 读取可见信息，作为详情接口缺失时的补充。
   function extractDetailInfo() {
-    const root = Array.from(document.querySelectorAll('.job-detail-box'))
+    const root = Array.from(document.querySelectorAll([
+      '.job-detail-box',
+      '.job-detail-container',
+      '.job-detail-wrapper',
+      '.job-detail',
+      '[class*="job-detail"]',
+      '[class*="job-detail-card"]',
+    ].join(',')))
       .find((element) => isVisible(element));
     if (!root) return {};
 
     const detail = {};
-    const jobName = normalizeText((root.querySelector('.job-detail-header .job-name') || {}).textContent || '');
-    const salary = getReadableSalary((root.querySelector('.job-detail-header .job-salary') || {}).textContent || '');
+    const jobName = normalizeText((
+      root.querySelector(
+        '.job-detail-header .job-name, .job-name, [class*="job-name"], [class*="job-title"], h1'
+      ) || {}
+    ).textContent || '');
+    const salary = getReadableSalary((
+      root.querySelector(
+        '.job-detail-header .job-salary, .job-salary, [class*="salary"]'
+      ) || {}
+    ).textContent || '');
     if (jobName) detail.jobName = jobName;
     if (salary) detail.salary = salary;
 
-    const bossRoot = root.querySelector('.job-boss-info');
+    const bossRoot = root.querySelector(
+      '.job-boss-info, [class*="job-boss-info"], [class*="boss-info-card"]'
+    );
     if (bossRoot) {
-      const nameElement = bossRoot.querySelector('h2.name');
+      const nameElement = bossRoot.querySelector('h2.name, .name, [class*="boss-name"]');
       if (nameElement) {
         const clone = nameElement.cloneNode(true);
         clone.querySelectorAll('i, .boss-online-tag, .boss-active-time').forEach((item) => item.remove());
         detail.bossName = normalizeText(clone.textContent || '');
       }
 
-      const attr = normalizeText((bossRoot.querySelector('.boss-info-attr') || {}).textContent || '');
+      const attr = normalizeText((
+        bossRoot.querySelector('.boss-info-attr, [class*="boss-info-attr"], [class*="boss-info"]') || {}
+      ).textContent || '');
       const parts = attr.split('·').map(normalizeText).filter(Boolean);
       if (parts[0]) detail.company = parts[0];
       if (parts.length > 1) detail.bossTitle = parts[parts.length - 1];
@@ -6050,14 +6069,18 @@
     if (bossActiveInfo.bossActiveTimeDesc) detail.bossActiveTimeDesc = bossActiveInfo.bossActiveTimeDesc;
     if (bossActiveInfo.bossOnline) detail.bossOnline = true;
 
-    const tags = Array.from(root.querySelectorAll('.job-detail-header .tag-list li'))
+    const tags = Array.from(root.querySelectorAll(
+      '.job-detail-header .tag-list li, .tag-list li, [class*="tag-list"] li'
+    ))
       .map((element) => normalizeText(element.textContent || ''))
       .filter(Boolean);
     if (tags[0]) detail.city = tags[0];
     if (tags[1]) detail.experience = tags[1];
     if (tags[2]) detail.degree = tags[2];
 
-    const address = normalizeText((root.querySelector('.job-address-desc') || {}).textContent || '');
+    const address = normalizeText((
+      root.querySelector('.job-address-desc, [class*="address-desc"], [class*="job-address"]') || {}
+    ).textContent || '');
     if (address) detail.address = address;
 
     return detail;
@@ -6580,10 +6603,27 @@
   // 岗位卡片切换后，必须确认右侧详情标题和沟通按钮都属于目标岗位，避免误点上一条残留详情。
   function getJobCommunicationDetailReady(job) {
     const detail = extractDetailInfo();
-    if (!detail || !detail.jobName || !areComparableTextsCompatible(job && job.jobName, detail.jobName)) return null;
     const chatButton = findChatButton(job);
     if (!chatButton) return null;
-    return { detail, chatButton };
+
+    const detailMatches = detail &&
+      detail.jobName &&
+      areComparableTextsCompatible(job && job.jobName, detail.jobName);
+    if (detailMatches) return { detail, chatButton };
+
+    // 新版页面偶尔改标题结构，但按钮上的加密岗位 ID 仍可作为强身份兜底。
+    const encryptJobId = normalizeText(job && job.encryptJobId);
+    const buttonIdentity = [
+      chatButton.getAttribute('ka'),
+      chatButton.getAttribute('href'),
+      chatButton.getAttribute('data-jobid'),
+      chatButton.getAttribute('data-job-id'),
+    ].filter(Boolean).join('|');
+    if (encryptJobId && buttonIdentity.includes(encryptJobId)) {
+      return { detail: detail || {}, chatButton, identityOnly: true };
+    }
+
+    return null;
   }
 
   // 要求“详情标题 + 公司 + 按钮身份”持续稳定一段时间，吸收 SPA 中旧详情响应晚到造成的瞬时回写。
@@ -6630,8 +6670,33 @@
 
   // 在岗位详情页查找“立即沟通/继续沟通”按钮，点击它会进入聊天页。
   function findChatButton(job) {
-    const candidates = Array.from(document.querySelectorAll('a.op-btn.op-btn-chat'))
-      .filter((element) => isVisible(element) && /立即沟通|继续沟通/.test(normalizeText(element.innerText || element.textContent || '')));
+    const selectorMatches = Array.from(document.querySelectorAll([
+      'a.op-btn.op-btn-chat',
+      'a.op-btn-chat',
+      '[class*="op-btn-chat"]',
+      '[class*="startchat"]',
+      '[class*="start-chat"]',
+      '[ka*="job_chat"]',
+      '[ka*="chat"]',
+      '.job-detail-box a',
+      '.job-detail-container a',
+      '.job-detail-wrapper a',
+    ].join(',')));
+    const textMatches = Array.from(document.querySelectorAll('a, button, [role="button"]'))
+      .filter((element) => {
+        if (!isVisible(element)) return false;
+        const text = normalizeText(element.innerText || element.textContent || '');
+        return /^(立即沟通|继续沟通)$/.test(text);
+      });
+    const candidates = Array.from(new Set(selectorMatches.concat(textMatches)))
+      .filter((element) => {
+        if (!isVisible(element)) return false;
+        const text = normalizeText(element.innerText || element.textContent || '');
+        return /立即沟通|继续沟通|沟通/.test(text) ||
+          /op-btn-chat|startchat|start-chat/i.test(String(element.className || ''));
+      });
+    if (!candidates.length) return null;
+
     const encryptJobId = normalizeText(job && job.encryptJobId);
     if (!encryptJobId) return candidates[0] || null;
 
@@ -6643,7 +6708,7 @@
         element.getAttribute('data-job-id'),
       ].filter(Boolean).join('|');
       return identityText.includes(encryptJobId);
-    }) || null;
+    }) || candidates[0] || null;
   }
 
   // 聊天页常用语按钮定位，当前发送流程主要使用文本注入，这里保留给兼容判断。
@@ -8012,8 +8077,10 @@
 
   // 监听右侧详情的稳定父容器，既能捕获内容更新，也能覆盖详情盒子被整体替换的情况。
   function getJobDetailObserverRoot() {
-    const detail = Array.from(document.querySelectorAll('.job-detail-box')).find(isVisible) ||
-      document.querySelector('.job-detail-container, .job-detail-wrapper');
+    const detail = Array.from(document.querySelectorAll(
+      '.job-detail-box, .job-detail-container, .job-detail-wrapper, .job-detail, [class*="job-detail"]'
+    )).find(isVisible) ||
+      document.querySelector('.job-detail-container, .job-detail-wrapper, [class*="job-detail"]');
     return detail && detail.parentElement || detail || getPageObserverRoot();
   }
 
